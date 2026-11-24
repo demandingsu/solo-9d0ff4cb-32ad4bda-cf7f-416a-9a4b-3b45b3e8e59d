@@ -60,60 +60,66 @@ def validate_report(payload: dict) -> None:
 # ---------------------------------------------------------------- 明细
 
 def submit_details(db: Database, shift_id: str, items: list[dict]) -> dict:
-    report = db.get_report(shift_id)
-    if report is None:
-        raise ValidationError(f"班次 {shift_id} 的班报不存在，请先登记班报")
+    # 全部读->合并->校验->写在单个数据库事务（单次持锁）内完成，
+    # 与整段修复并发时后写者基于先写者已提交的最新状态校验，杜绝写偏覆盖。
+    def validator(conn, report, current_rows):
+        if report is None:
+            raise ValidationError(
+                f"班次 {shift_id} 的班报不存在，请先登记班报")
 
-    bucket_specs = report["buckets"]
-    capacity: dict[tuple[str, int], int] = {
-        (t["terminal_id"], t["bucket_idx"]): t["count"]
-        for t in report["terminals"]}
+        bucket_specs = report["buckets"]
+        capacity: dict[tuple[str, int], int] = {
+            (t["terminal_id"], t["bucket_idx"]): t["count"]
+            for t in report["terminals"]}
 
-    errors: list[dict] = []
-    merged: dict[tuple[str, int], tuple[int, int]] = {}
-    for r in db.list_details(shift_id):
-        merged[(r["terminal_id"], r["seq"])] = (r["bucket_idx"], r["value_ms"])
+        errors: list[dict] = []
+        merged: dict[tuple[str, int], tuple[int, int]] = {}
+        for r in current_rows:
+            merged[(r["terminal_id"], r["seq"])] = \
+                (r["bucket_idx"], r["value_ms"])
 
-    corrected = 0
-    inserted = 0
-    for idx, it in enumerate(items):
-        term, seq, bidx, val = (it["terminal_id"], it["seq"],
-                                it["bucket_idx"], it["value_ms"])
-        if bidx < 0 or bidx >= len(bucket_specs):
-            errors.append({"index": idx, "terminal_id": term, "seq": seq,
-                           "error": f"分档序号 {bidx} 越界"})
-            continue
-        b = bucket_specs[bidx]
-        if not (b["lo"] <= val <= b["hi"]):
-            errors.append({"index": idx, "terminal_id": term, "seq": seq,
-                           "error": f"耗时 {val}ms 超出本终端分档闭区间 "
-                                    f"[{b['lo']}, {b['hi']}]"})
-            continue
-        if (term, bidx) not in capacity:
-            errors.append({"index": idx, "terminal_id": term, "seq": seq,
-                           "error": "班报未声明该终端在此分档的笔数"})
-            continue
-        key = (term, seq)
-        corrected += int(key in merged)
-        inserted += int(key not in merged)
-        merged[key] = (bidx, val)
+        corrected = 0
+        inserted = 0
+        for idx, it in enumerate(items):
+            term, seq, bidx, val = (it["terminal_id"], it["seq"],
+                                    it["bucket_idx"], it["value_ms"])
+            if bidx < 0 or bidx >= len(bucket_specs):
+                errors.append({"index": idx, "terminal_id": term, "seq": seq,
+                               "error": f"分档序号 {bidx} 越界"})
+                continue
+            b = bucket_specs[bidx]
+            if not (b["lo"] <= val <= b["hi"]):
+                errors.append({"index": idx, "terminal_id": term, "seq": seq,
+                               "error": f"耗时 {val}ms 超出本终端分档闭区间 "
+                                        f"[{b['lo']}, {b['hi']}]"})
+                continue
+            if (term, bidx) not in capacity:
+                errors.append({"index": idx, "terminal_id": term, "seq": seq,
+                               "error": "班报未声明该终端在此分档的笔数"})
+                continue
+            key = (term, seq)
+            corrected += int(key in merged)
+            inserted += int(key not in merged)
+            merged[key] = (bidx, val)
 
-    if errors:
-        raise ValidationError(errors)          # 整批退回，不落库
+        if errors:
+            raise ValidationError(errors)          # 整批退回，不落库
 
-    # 逐 (终端, 分档) 检查档内笔数上限
-    used: dict[tuple[str, int], int] = {}
-    for (term, _seq), (bidx, _val) in merged.items():
-        used[(term, bidx)] = used.get((term, bidx), 0) + 1
-    over = [{"terminal_id": k[0], "bucket_idx": k[1],
-             "stored": v, "capacity": capacity[k],
-             "error": "已提交笔数超出本终端档内笔数"}
-            for k, v in used.items() if v > capacity[k]]
-    if over:
-        raise ValidationError(over)
+        # 逐 (终端, 分档) 检查档内笔数上限（基于事务内最新状态）
+        used: dict[tuple[str, int], int] = {}
+        for (term, _seq), (bidx, _val) in merged.items():
+            used[(term, bidx)] = used.get((term, bidx), 0) + 1
+        over = [{"terminal_id": k[0], "bucket_idx": k[1],
+                 "stored": v, "capacity": capacity[k],
+                 "error": "已提交笔数超出本终端档内笔数"}
+                for k, v in used.items() if v > capacity[k]]
+        if over:
+            raise ValidationError(over)
 
-    return db.replace_merged(shift_id, merged,
-                             {"corrected": corrected, "inserted": inserted})
+        return merged, {"stored": len(merged),
+                        "corrected": corrected, "inserted": inserted}
+
+    return db.submit_details_tx(shift_id, items, validator)
 
 
 # ---------------------------------------------------------------- 核对

@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: shift-quantile-check:latest
+    container_name: shift-quantile-check
+    ports:
+      - "8000:8000"
+    volumes:
+      - shift_data:/data
+    environment:
+      APP_DB_PATH: /data/shift.db
+    restart: unless-stopped
+
+volumes:
+  shift_data:
